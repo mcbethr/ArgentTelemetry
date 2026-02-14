@@ -1,3 +1,4 @@
 ArgentTelemetry.env
 .env
 *.csv
+*.xlsx

@@ -20,7 +20,7 @@ import csv
 import argparse
 from typing import Dict, Any, Iterator, Optional, List
 from dotenv import load_dotenv, find_dotenv
-load_dotenv(Path("~/.env"))
+load_dotenv()
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
