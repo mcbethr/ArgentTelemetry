@@ -1,1 +1,3 @@
 ArgentTelemetry.env
+.env
+*.csv
