@@ -25,6 +25,25 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
 
+def get_channel_info(yt, video_id: str):
+    """
+    Given a video ID, returns (channel_name, channel_id)
+    """
+    req = yt.videos().list(
+        part="snippet",
+        id=video_id
+    )
+    resp = req.execute()
+    snippet = resp["items"][0]["snippet"]
+    return snippet["channelTitle"], snippet["channelId"]
+
+
+def sanitize_filename(name: str) -> str:
+    """
+    Makes channel name safe for macOS filenames
+    """
+    return re.sub(r'[<>:"/\\|?*]', '', name).strip()
+
 def extract_video_id(url_or_id: str) -> str:
     # Accept raw video ID
     if re.fullmatch(r"[A-Za-z0-9_-]{11}", url_or_id):
@@ -110,7 +129,6 @@ def iter_comment_threads(
         if not page_token:
             break
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("video", help="YouTube video URL or 11-char video id")
@@ -128,6 +146,13 @@ def main():
     video_id = extract_video_id(args.video)
     yt = youtube_client(api_key)
 
+    channel_name, channel_id = get_channel_info(yt, video_id)
+    safe_channel = sanitize_filename(channel_name)
+
+    output_filename = f"{safe_channel}-{channel_id}.csv"
+
+    print(f"Output file: {output_filename}")
+
     fieldnames = [
         "comment_id",
         "parent_id",
@@ -141,7 +166,7 @@ def main():
     ]
 
     try:
-        with open(args.out, "w", newline="", encoding="utf-8") as f:
+        with open(output_filename, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=fieldnames)
             w.writeheader()
 
