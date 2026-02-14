@@ -18,12 +18,67 @@ import os
 import re
 import csv
 import argparse
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 from typing import Dict, Any, Iterator, Optional, List
 from dotenv import load_dotenv, find_dotenv
 load_dotenv()
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+def get_video_metadata(yt, video_id: str) -> Dict[str, str]:
+    """
+    Returns video metadata needed for the 'Channel Data' tab.
+    """
+    resp = yt.videos().list(
+        part="snippet",
+        id=video_id
+    ).execute()
+
+    if not resp.get("items"):
+        raise ValueError(f"Video not found or not accessible: {video_id}")
+
+    snip = resp["items"][0]["snippet"]
+    return {
+        "video_id": video_id,
+        "video_title": snip.get("title", ""),
+        "upload_date": snip.get("publishedAt", ""),
+        "channel_id": snip.get("channelId", ""),
+        "channel_name": snip.get("channelTitle", ""),
+        "video_link": f"https://www.youtube.com/watch?v={video_id}",
+    }
+
+
+def get_channel_handle_like(yt, channel_id: str) -> str:
+    """
+    Best-effort channel 'handle' field. The API commonly provides 'customUrl'
+    which is often '@handle' but not guaranteed.
+    """
+    resp = yt.channels().list(
+        part="snippet",
+        id=channel_id
+    ).execute()
+
+    if not resp.get("items"):
+        return ""
+
+    snip = resp["items"][0]["snippet"]
+    # Often looks like "@RyanMcBeth" or "c/SomeName" depending on channel
+    return snip.get("customUrl", "") or ""
+
+
+def autosize_columns(ws):
+    """
+    Simple autosize for openpyxl based on max string length per column.
+    """
+    for col in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            if cell.value is None:
+                continue
+            max_len = max(max_len, len(str(cell.value)))
+        ws.column_dimensions[col_letter].width = min(max_len + 2, 80)
 
 def get_channel_info(yt, video_id: str):
     """
@@ -146,6 +201,10 @@ def main():
     video_id = extract_video_id(args.video)
     yt = youtube_client(api_key)
 
+    # Metadata for the "Channel Data" sheet
+    meta = get_video_metadata(yt, video_id)
+    channel_handle = get_channel_handle_like(yt, meta["channel_id"])
+
     channel_name, channel_id = get_channel_info(yt, video_id)
     safe_channel = sanitize_filename(channel_name)
 
@@ -166,21 +225,65 @@ def main():
     ]
 
     try:
-        with open(output_filename, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fieldnames)
-            w.writeheader()
+        wb = Workbook()
 
-            count = 0
-            for row in iter_comment_threads(yt, video_id, order=args.order, include_replies=args.include_replies):
-                w.writerow(row)
-                count += 1
+        # Sheet 1: Telemetry Data (comments)
+        ws_telemetry = wb.active
+        ws_telemetry.title = "Telemetry Data"
 
-        print(f"Wrote {count} comments to {args.out}")
+        telemetry_headers = [
+            "video_id",
+            "comment_id",
+            "parent_id",
+            "author",
+            "author_channel_url",
+            "published_at",
+            "updated_at",
+            "like_count",
+            "is_pinned",
+            "text",
+        ]
+        ws_telemetry.append(telemetry_headers)
+
+        count = 0
+        for row in iter_comment_threads(yt, video_id, order=args.order, include_replies=args.include_replies):
+            ws_telemetry.append([
+                video_id,
+                row.get("comment_id", ""),
+                row.get("parent_id", ""),
+                row.get("author", ""),
+                row.get("author_channel_url", ""),
+                row.get("published_at", ""),
+                row.get("updated_at", ""),
+                row.get("like_count", 0),
+                row.get("is_pinned", False),
+                row.get("text", ""),
+            ])
+            count += 1
+
+        # Sheet 2: Channel Data (channel + video metadata)
+        ws_meta = wb.create_sheet("Channel Data")
+        meta_headers = ["Channel name", "Channel handle", "Video link", "Video Title", "Upload date"]
+        ws_meta.append(meta_headers)
+        ws_meta.append([
+            meta["channel_name"],
+            channel_handle,
+            meta["video_link"],
+            meta["video_title"],
+            meta["upload_date"],
+        ])
+
+        autosize_columns(ws_telemetry)
+        autosize_columns(ws_meta)
+
+        # Output filename: <ChannelName>-<ChannelID>.xlsx
+        out_xlsx = f"{safe_channel}-{channel_id}.xlsx"
+
+        wb.save(out_xlsx)
+        print(f"Wrote {count} comments to {out_xlsx}")
 
     except HttpError as e:
-        # Common errors: commentsDisabled, quotaExceeded, forbidden (private video)
         raise SystemExit(f"YouTube API error: {e}")
-
 
 if __name__ == "__main__":
     main()
