@@ -6,44 +6,40 @@ Outputs one Excel file per video with two sheets:
   1) "Telemetry Data"  - comment rows (includes channel_name column)
   2) "Comment data"    - channel/video metadata
 
+Batch mode also produces:
+  Master-YYYY-MM-DD_HHMMSS.xlsx
+  (Concatenation of all Telemetry Data sheets)
+
 Usage:
   export YT_API_KEY="YOUR_KEY_HERE"
-  python3 Argent.py "https://www.youtube.com/watch?v=VIDEOID" --include-replies
-  python3 Argent.py --video-file videos.txt --out-dir exports --include-replies
 
-videos.txt format:
-  - One URL/ID per line
-  - Lines starting with # are ignored
-  - Inline comments supported: URL # note
+  Single:
+  python3 Argent.py "https://www.youtube.com/watch?v=VIDEOID" --include-replies
+
+  Batch:
+  python3 Argent.py --video-file videos.txt --out-dir exports --include-replies
 """
 
 import os
 import re
 import argparse
 from typing import Dict, Any, Iterator, Optional, List
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 
 
 # -------------------------
-# Helpers: input parsing
+# Helpers: Input Parsing
 # -------------------------
 
 def read_video_list(path: str) -> List[str]:
-    """
-    Reads newline-separated video URLs/IDs.
-
-    Rules:
-      - Blank lines ignored
-      - Lines whose first non-whitespace char is '#' are ignored
-      - Inline comments supported: anything after a '#' is ignored
-        Example: https://youtu.be/abc123xyz00  # note
-    """
     vids: List[str] = []
     with open(path, "r", encoding="utf-8") as f:
         for raw in f:
@@ -61,31 +57,29 @@ def read_video_list(path: str) -> List[str]:
 
 def extract_video_id(url_or_id: str) -> str:
     if not isinstance(url_or_id, str):
-        raise ValueError(f"Expected video URL/ID string, got: {type(url_or_id)}")
+        raise ValueError(f"Expected string video ID, got {type(url_or_id)}")
 
     url_or_id = url_or_id.strip()
 
-    # Accept raw video ID
     if re.fullmatch(r"[A-Za-z0-9_-]{11}", url_or_id):
         return url_or_id
 
-    # Common URL formats
     patterns = [
         r"v=([A-Za-z0-9_-]{11})",
         r"youtu\.be/([A-Za-z0-9_-]{11})",
         r"shorts/([A-Za-z0-9_-]{11})",
         r"embed/([A-Za-z0-9_-]{11})",
     ]
+
     for p in patterns:
         m = re.search(p, url_or_id)
         if m:
             return m.group(1)
 
-    raise ValueError(f"Could not extract a video id from: {url_or_id}")
+    raise ValueError(f"Could not extract video ID from: {url_or_id}")
 
 
 def sanitize_filename(name: str) -> str:
-    # macOS-safe filename (strip reserved chars)
     return re.sub(r'[<>:"/\\|?*]', '', name).strip()
 
 
@@ -100,27 +94,21 @@ def youtube_client(api_key: str):
 def get_video_metadata(yt, video_id: str) -> Dict[str, str]:
     resp = yt.videos().list(part="snippet", id=video_id).execute()
     if not resp.get("items"):
-        raise ValueError(f"Video not found or not accessible: {video_id}")
+        raise ValueError(f"Video not found: {video_id}")
 
     snip = resp["items"][0]["snippet"]
-    channel_id = snip.get("channelId", "")
-    channel_name = snip.get("channelTitle", "")
 
     return {
         "video_id": video_id,
         "video_title": snip.get("title", ""),
         "upload_date": snip.get("publishedAt", ""),
-        "channel_id": channel_id,
-        "channel_name": channel_name,
+        "channel_id": snip.get("channelId", ""),
+        "channel_name": snip.get("channelTitle", ""),
         "video_link": f"https://www.youtube.com/watch?v={video_id}",
     }
 
 
 def get_channel_handle_like(yt, channel_id: str) -> str:
-    """
-    Best-effort channel 'handle' field.
-    The API commonly provides 'customUrl' which is sometimes "@handle" and sometimes not.
-    """
     if not channel_id:
         return ""
 
@@ -128,8 +116,7 @@ def get_channel_handle_like(yt, channel_id: str) -> str:
     if not resp.get("items"):
         return ""
 
-    snip = resp["items"][0]["snippet"]
-    return snip.get("customUrl", "") or ""
+    return resp["items"][0]["snippet"].get("customUrl", "") or ""
 
 
 def iter_comment_threads(
@@ -138,6 +125,7 @@ def iter_comment_threads(
     order: str = "time",
     include_replies: bool = False,
 ) -> Iterator[Dict[str, Any]]:
+
     page_token: Optional[str] = None
 
     while True:
@@ -145,7 +133,7 @@ def iter_comment_threads(
             part="snippet,replies",
             videoId=video_id,
             maxResults=100,
-            order=order,          # "time" or "relevance"
+            order=order,
             textFormat="plainText",
             pageToken=page_token,
         )
@@ -154,7 +142,6 @@ def iter_comment_threads(
         for item in resp.get("items", []):
             thr_snip = item["snippet"]
             top = thr_snip["topLevelComment"]["snippet"]
-            is_pinned = thr_snip.get("isPinned")
 
             yield {
                 "comment_id": item["snippet"]["topLevelComment"]["id"],
@@ -164,13 +151,12 @@ def iter_comment_threads(
                 "published_at": top.get("publishedAt"),
                 "updated_at": top.get("updatedAt"),
                 "like_count": top.get("likeCount", 0),
-                "is_pinned": is_pinned,
+                "is_pinned": thr_snip.get("isPinned"),
                 "text": top.get("textDisplay", ""),
             }
 
             if include_replies and "replies" in item:
-                replies = item["replies"].get("comments", [])
-                for r in replies:
+                for r in item["replies"]["comments"]:
                     r_snip = r["snippet"]
                     yield {
                         "comment_id": r["id"],
@@ -190,7 +176,7 @@ def iter_comment_threads(
 
 
 # -------------------------
-# Excel output
+# Excel Helpers
 # -------------------------
 
 def autosize_columns(ws):
@@ -198,9 +184,8 @@ def autosize_columns(ws):
         max_len = 0
         col_letter = get_column_letter(col[0].column)
         for cell in col:
-            if cell.value is None:
-                continue
-            max_len = max(max_len, len(str(cell.value)))
+            if cell.value:
+                max_len = max(max_len, len(str(cell.value)))
         ws.column_dimensions[col_letter].width = min(max_len + 2, 80)
 
 
@@ -211,27 +196,25 @@ def export_video_to_excel(
     order: str,
     include_replies: bool,
 ) -> str:
-    """
-    Exports one video's comments to an .xlsx and returns output path.
-    """
-    video_id = extract_video_id(video_input)
 
+    video_id = extract_video_id(video_input)
     meta = get_video_metadata(yt, video_id)
     channel_handle = get_channel_handle_like(yt, meta["channel_id"])
 
-    channel_name = meta["channel_name"]
-    channel_id = meta["channel_id"]
-    safe_channel = sanitize_filename(channel_name) or "UnknownChannel"
-
+    safe_channel = sanitize_filename(meta["channel_name"]) or "UnknownChannel"
     os.makedirs(out_dir, exist_ok=True)
-    out_xlsx = os.path.join(out_dir, f"{safe_channel}-{channel_id}-{video_id}.xlsx")
+
+    out_xlsx = os.path.join(
+        out_dir,
+        f"{safe_channel}-{meta['channel_id']}-{video_id}.xlsx"
+    )
 
     wb = Workbook()
 
-    # Sheet 1: Telemetry Data
-    ws_telemetry = wb.active
-    ws_telemetry.title = "Telemetry Data"
-    ws_telemetry.append([
+    # Telemetry Sheet
+    ws = wb.active
+    ws.title = "Telemetry Data"
+    ws.append([
         "channel_name",
         "video_id",
         "comment_id",
@@ -246,23 +229,23 @@ def export_video_to_excel(
     ])
 
     count = 0
-    for row in iter_comment_threads(yt, video_id, order=order, include_replies=include_replies):
-        ws_telemetry.append([
-            channel_name,
+    for row in iter_comment_threads(yt, video_id, order, include_replies):
+        ws.append([
+            meta["channel_name"],
             video_id,
-            row.get("comment_id", ""),
-            row.get("parent_id", ""),
-            row.get("author", ""),
-            row.get("author_channel_url", ""),
-            row.get("published_at", ""),
-            row.get("updated_at", ""),
-            row.get("like_count", 0),
-            row.get("is_pinned", False),
-            row.get("text", ""),
+            row["comment_id"],
+            row["parent_id"],
+            row["author"],
+            row["author_channel_url"],
+            row["published_at"],
+            row["updated_at"],
+            row["like_count"],
+            row["is_pinned"],
+            row["text"],
         ])
         count += 1
 
-    # Sheet 2: Comment data (metadata)
+    # Metadata Sheet
     ws_meta = wb.create_sheet("Comment data")
     ws_meta.append(["Channel name", "Channel handle", "Video link", "Video Title", "Upload date"])
     ws_meta.append([
@@ -273,12 +256,52 @@ def export_video_to_excel(
         meta["upload_date"],
     ])
 
-    autosize_columns(ws_telemetry)
+    autosize_columns(ws)
     autosize_columns(ws_meta)
 
     wb.save(out_xlsx)
     print(f"Wrote {count} comments -> {out_xlsx}")
     return out_xlsx
+
+
+def create_master_workbook(excel_paths: List[str], out_dir: str) -> str:
+    tz = ZoneInfo("America/New_York")
+    stamp = datetime.now(tz).strftime("%Y-%m-%d_%H%M%S")
+    out_path = os.path.join(out_dir, f"Master-{stamp}.xlsx")
+
+    master_wb = Workbook()
+    master_ws = master_wb.active
+    master_ws.title = "Telemetry Data"
+
+    wrote_header = False
+
+    for p in excel_paths:
+        wb = load_workbook(p, read_only=True, data_only=True)
+        if "Telemetry Data" not in wb.sheetnames:
+            wb.close()
+            continue
+
+        ws = wb["Telemetry Data"]
+        rows = ws.iter_rows(values_only=True)
+
+        try:
+            header = next(rows)
+        except StopIteration:
+            wb.close()
+            continue
+
+        if not wrote_header:
+            master_ws.append(list(header))
+            wrote_header = True
+
+        for r in rows:
+            master_ws.append(list(r))
+
+        wb.close()
+
+    master_wb.save(out_path)
+    print(f"Master workbook created -> {out_path}")
+    return out_path
 
 
 # -------------------------
@@ -287,17 +310,17 @@ def export_video_to_excel(
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("video", nargs="?", help="YouTube video URL or 11-char video id (single mode)")
-    ap.add_argument("--video-file", help="Text file with YouTube video URLs/IDs, one per line (batch mode)")
-    ap.add_argument("--out-dir", default="exports", help="Output directory for batch exports (or single if you want)")
-    ap.add_argument("--order", choices=["time", "relevance"], default="time", help="API sort order")
-    ap.add_argument("--include-replies", action="store_true", help="Also export replies")
+    ap.add_argument("video", nargs="?", help="Single video URL/ID")
+    ap.add_argument("--video-file", help="Text file with video URLs/IDs")
+    ap.add_argument("--out-dir", default="exports", help="Output directory")
+    ap.add_argument("--order", choices=["time", "relevance"], default="time")
+    ap.add_argument("--include-replies", action="store_true")
     args = ap.parse_args()
 
     load_dotenv()
     api_key = os.getenv("YT_API_KEY")
     if not api_key:
-        raise SystemExit("Set env var YT_API_KEY to your YouTube Data API key first.")
+        raise SystemExit("Set env var YT_API_KEY first.")
 
     yt = youtube_client(api_key)
 
@@ -305,39 +328,28 @@ def main():
     if args.video_file:
         videos = read_video_list(args.video_file)
         if not videos:
-            raise SystemExit(f"No videos found in {args.video_file}")
+            raise SystemExit("No valid videos found.")
 
-        ok, failed = 0, 0
+        outputs = []
         for v in videos:
             try:
-                export_video_to_excel(
-                    yt=yt,
-                    video_input=v,
-                    out_dir=args.out_dir,
-                    order=args.order,
-                    include_replies=args.include_replies,
+                out_path = export_video_to_excel(
+                    yt, v, args.out_dir, args.order, args.include_replies
                 )
-                ok += 1
-            except HttpError as e:
-                print(f"[!] YouTube API error for {v}: {e}")
-                failed += 1
+                outputs.append(out_path)
             except Exception as e:
-                print(f"[!] Failed for {v}: {e}")
-                failed += 1
+                print(f"[!] Failed: {v} -> {e}")
 
-        print(f"\nDone. Success: {ok}, Failed: {failed}")
+        if outputs:
+            create_master_workbook(outputs, args.out_dir)
         return
 
     # Single mode
     if not args.video:
-        raise SystemExit("Provide a single video URL/ID or use --video-file <path>.")
+        raise SystemExit("Provide a video or --video-file.")
 
     export_video_to_excel(
-        yt=yt,
-        video_input=args.video,
-        out_dir=".",  # single mode writes to current directory
-        order=args.order,
-        include_replies=args.include_replies,
+        yt, args.video, ".", args.order, args.include_replies
     )
 
 
