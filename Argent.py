@@ -27,18 +27,37 @@ load_dotenv()
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-#Adding in batch mode
 def read_video_list(path: str) -> List[str]:
     """
-    Reads newline-separated video URLs/IDs. Ignores blank lines and #comments.
+    Reads newline-separated video URLs/IDs.
+
+    Rules:
+      - Blank lines ignored
+      - Lines whose first non-whitespace char is '#' are ignored
+      - Inline comments supported: anything after a ' #' is ignored
+        Example: https://youtu.be/abc123xyz00  # note
     """
     vids: List[str] = []
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            s = line.strip()
-            if not s or s.startswith("#"):
+        for raw in f:
+            line = raw.strip()
+            if not line:
                 continue
-            vids.append(s)
+
+            # Full-line comment (allow leading whitespace)
+            if line.startswith("#"):
+                continue
+
+            # Inline comment: split on first '#' and keep left side
+            # This lets you annotate URLs on the same line.
+            if "#" in line:
+                line = line.split("#", 1)[0].strip()
+
+            if not line:
+                continue
+
+            vids.append(line)
+
     return vids
 
 
